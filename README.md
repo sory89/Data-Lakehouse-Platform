@@ -362,9 +362,3 @@ lakehouse/
 └── docker-compose.yml            # 32+ containers
 ```
 
----
-
-## 📝 License
-
-MIT
-# Data-Lakehouse-Platform
