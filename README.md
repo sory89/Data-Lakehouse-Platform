@@ -259,14 +259,8 @@ Cleanup historique · MinIO stats · MAJ catalog
 
 ```powershell
 # Windows
-$env:DOCKER_BUILDKIT=0
 docker compose up --build
 
-# Lancer le ML pipeline
-docker compose run --rm ml-feature-pipeline
-
-# Sync ClickHouse
-docker compose run --rm clickhouse-sync
 ```
 
 ---
