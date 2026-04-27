@@ -157,9 +157,6 @@ curl "http://localhost:8123/?query=SELECT+count()+FROM+lakehouse.daily_sales&use
 | **UPDATE / DELETE** | Natif | Limité |
 | **Cas d'usage** | API serving | Dashboards BI, ad-hoc |
 
-### En production
-
-ClickHouse remplace Redshift, BigQuery ou Snowflake pour les besoins analytiques — même pattern qu'Uber, Cloudflare ou Yandex qui traitent des pétaoctets avec ClickHouse.
 
 ---
 
