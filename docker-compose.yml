@@ -1,0 +1,366 @@
+services:
+
+  # ── PostgreSQL (metastore + Gold target) ─────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: lakehouse-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB:       lakehouse
+      POSTGRES_USER:     lakehouse
+      POSTGRES_PASSWORD: lakehouse
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lakehouse"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+
+  # ── ClickHouse (Analytics OLAP) ───────────────────────────────────────────
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.3-alpine
+    container_name: lakehouse-clickhouse
+    restart: unless-stopped
+    ports:
+      - "8123:8123"   # HTTP interface
+      - "9009:9000"   # Native TCP (9000 used by MinIO)
+    environment:
+      CLICKHOUSE_DB:       lakehouse
+      CLICKHOUSE_USER:     lakehouse
+      CLICKHOUSE_PASSWORD: lakehouse
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+      - ./clickhouse/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "clickhouse-client --query='SELECT 1' || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+
+  # ── MinIO (S3-compatible object storage) ─────────────────────────────────────
+  minio:
+    image: minio/minio:latest
+    container_name: lakehouse-minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER:     minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - miniodata:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # ── Data Generator (writes to Bronze) ────────────────────────────────────────
+  generator:
+    build: ./ingestion
+    container_name: lakehouse-generator
+    restart: unless-stopped
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ENDPOINT:   "http://minio:9000"
+      MINIO_ACCESS:     minioadmin
+      MINIO_SECRET:     minioadmin
+      BRONZE_BUCKET:    bronze
+      INTERVAL_SECONDS: "60"
+
+  # ── Spark: Bronze → Silver ────────────────────────────────────────────────────
+  spark-bronze-silver:
+    build: ./spark
+    container_name: lakehouse-spark-b2s
+    restart: "no"
+    depends_on:
+      minio:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    command: >
+      /opt/spark/bin/spark-submit
+      --master local[2]
+      --packages org.apache.hadoop:hadoop-aws:3.3.4,com.amazonaws:aws-java-sdk-bundle:1.12.262
+      --jars /opt/spark/jars/iceberg-spark-runtime-3.5_2.12-1.4.3.jar,/opt/spark/jars/iceberg-aws-bundle-1.4.3.jar,/opt/spark/jars/postgresql-42.7.3.jar
+      /opt/spark-jobs/bronze_to_silver.py
+    environment:
+      MINIO_ENDPOINT: "http://minio:9000"
+      MINIO_ACCESS:   minioadmin
+      MINIO_SECRET:   minioadmin
+      DB_DSN:         "host=postgres port=5432 dbname=lakehouse user=lakehouse password=lakehouse"
+      DB_URL:         "jdbc:postgresql://postgres:5432/lakehouse"
+
+  # ── Spark: Silver → Gold ──────────────────────────────────────────────────────
+  spark-silver-gold:
+    build: ./spark
+    container_name: lakehouse-spark-s2g
+    restart: "no"
+    depends_on:
+      minio:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    command: >
+      /opt/spark/bin/spark-submit
+      --master local[2]
+      --packages org.apache.hadoop:hadoop-aws:3.3.4,com.amazonaws:aws-java-sdk-bundle:1.12.262
+      --jars /opt/spark/jars/iceberg-spark-runtime-3.5_2.12-1.4.3.jar,/opt/spark/jars/iceberg-aws-bundle-1.4.3.jar,/opt/spark/jars/postgresql-42.7.3.jar
+      /opt/spark-jobs/silver_to_gold.py
+    environment:
+      MINIO_ENDPOINT: "http://minio:9000"
+      MINIO_ACCESS:   minioadmin
+      MINIO_SECRET:   minioadmin
+      DB_DSN:         "host=postgres port=5432 dbname=lakehouse user=lakehouse password=lakehouse"
+      DB_URL:         "jdbc:postgresql://postgres:5432/lakehouse"
+
+  # ── dbt ───────────────────────────────────────────────────────────────────────
+  dbt:
+    build: ./dbt_project
+    container_name: lakehouse-dbt
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      POSTGRES_HOST:     postgres
+      POSTGRES_USER:     lakehouse
+      POSTGRES_PASSWORD: lakehouse
+      POSTGRES_DB:       lakehouse
+
+  # ── Go API (serves Gold layer) ────────────────────────────────────────────────
+  api:
+    build: ./api
+    container_name: lakehouse-api
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    environment:
+      DATABASE_URL: "postgres://lakehouse:lakehouse@postgres:5432/lakehouse"
+
+  # ── Streamlit Dashboard ───────────────────────────────────────────────────────
+  streamlit:
+    build: ./streamlit
+    container_name: lakehouse-streamlit
+    restart: unless-stopped
+    depends_on:
+      - api
+    ports:
+      - "8501:8501"
+    environment:
+      API_BASE: "http://api:8080"
+
+
+
+  # ── MLflow (Experiment tracking + Model Registry) ──────────────────────────
+  mlflow:
+    build: ./mlflow
+    container_name: lakehouse-mlflow
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    ports:
+      - "5001:5001"
+    environment:
+      MLFLOW_S3_ENDPOINT_URL:  "http://minio:9000"
+      AWS_ACCESS_KEY_ID:        minioadmin
+      AWS_SECRET_ACCESS_KEY:    minioadmin
+      MLFLOW_TRACKING_URI:      "http://mlflow:5001"
+
+
+  # ── ML Feature Pipeline (Spark + scikit-learn + MLflow) ────────────────────
+  ml-feature-pipeline:
+    build: ./ml/pipelines
+    container_name: lakehouse-ml-pipeline
+    restart: "no"
+    depends_on:
+      minio:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    command: >
+      /opt/spark/bin/spark-submit
+      --master local[2]
+      --conf spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions
+      --conf spark.sql.catalog.lakehouse=org.apache.iceberg.spark.SparkCatalog
+      --conf spark.sql.catalog.lakehouse.type=hadoop
+      --conf spark.sql.catalog.lakehouse.warehouse=s3a://silver/iceberg
+      /opt/spark-jobs/feature_pipeline.py
+    environment:
+      MINIO_ENDPOINT:      "http://minio:9000"
+      MINIO_ACCESS:         minioadmin
+      MINIO_SECRET:         minioadmin
+      DB_DSN:              "host=postgres port=5432 dbname=lakehouse user=lakehouse password=lakehouse"
+      MLFLOW_TRACKING_URI: "http://mlflow:5001"
+      MLFLOW_S3_ENDPOINT_URL: "http://minio:9000"
+      AWS_ACCESS_KEY_ID:    minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+
+
+  # ── ClickHouse Sync (PostgreSQL → ClickHouse) ─────────────────────────────
+  clickhouse-sync:
+    build: ./clickhouse
+    container_name: lakehouse-clickhouse-sync
+    restart: "no"
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    environment:
+      DB_DSN:              "host=postgres port=5432 dbname=lakehouse user=lakehouse password=lakehouse"
+      CLICKHOUSE_HOST:      clickhouse
+      CLICKHOUSE_PORT:      "8123"
+      CLICKHOUSE_USER:      lakehouse
+      CLICKHOUSE_PASSWORD:  lakehouse
+      CLICKHOUSE_DB:        lakehouse
+
+  # ── Airflow Infrastructure ─────────────────────────────────────────────────
+  airflow-postgres:
+    image: postgres:16-alpine
+    container_name: lakehouse-airflow-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB:       airflow
+      POSTGRES_USER:     airflow
+      POSTGRES_PASSWORD: airflow
+    volumes:
+      - airflow_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airflow"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  airflow-redis:
+    image: redis:7-alpine
+    container_name: lakehouse-airflow-redis
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ── Airflow Init (DB migrate + create admin user) ──────────────────────────
+  airflow-init:
+    build: ./airflow
+    container_name: lakehouse-airflow-init
+    restart: "no"
+    depends_on:
+      airflow-postgres:
+        condition: service_healthy
+      airflow-redis:
+        condition: service_healthy
+    env_file: ./airflow/airflow.env
+    environment:
+      _AIRFLOW_DB_MIGRATE: "true"
+      _AIRFLOW_WWW_USER_CREATE: "true"
+      _AIRFLOW_WWW_USER_USERNAME: admin
+      _AIRFLOW_WWW_USER_PASSWORD: admin
+      _AIRFLOW_WWW_USER_FIRSTNAME: Data
+      _AIRFLOW_WWW_USER_LASTNAME: Engineer
+      _AIRFLOW_WWW_USER_EMAIL: admin@lakehouse.io
+      _AIRFLOW_WWW_USER_ROLE: Admin
+    command: >
+      bash -c "
+        airflow db migrate &&
+        airflow users create --username admin --password admin --firstname Data --lastname Engineer --role Admin --email admin@lakehouse.io || true &&
+        airflow connections add lakehouse_postgres --conn-uri postgres://lakehouse:lakehouse@postgres:5432/lakehouse || true
+      "
+    volumes:
+      - airflow_logs:/opt/airflow/logs
+
+  # ── Airflow Webserver ──────────────────────────────────────────────────────
+  airflow-webserver:
+    build: ./airflow
+    container_name: lakehouse-airflow-webserver
+    restart: unless-stopped
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    env_file: ./airflow/airflow.env
+    command: webserver
+    ports:
+      - "8082:8080"
+    volumes:
+      - airflow_logs:/opt/airflow/logs
+      - /var/run/docker.sock:/var/run/docker.sock
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  # ── Airflow Scheduler ──────────────────────────────────────────────────────
+  airflow-scheduler:
+    build: ./airflow
+    container_name: lakehouse-airflow-scheduler
+    restart: unless-stopped
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    env_file: ./airflow/airflow.env
+    command: scheduler
+    volumes:
+      - airflow_logs:/opt/airflow/logs
+      - /var/run/docker.sock:/var/run/docker.sock
+    healthcheck:
+      test: ["CMD-SHELL", "airflow jobs check --job-type SchedulerJob --hostname $(hostname)"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  # ── Airflow Worker (Celery) ────────────────────────────────────────────────
+  airflow-worker:
+    build: ./airflow
+    container_name: lakehouse-airflow-worker
+    restart: unless-stopped
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    env_file: ./airflow/airflow.env
+    command: celery worker
+    volumes:
+      - airflow_logs:/opt/airflow/logs
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      DUMB_INIT_SETSID: "0"
+
+  # ── Airflow Flower (Celery monitoring) ────────────────────────────────────
+  airflow-flower:
+    build: ./airflow
+    container_name: lakehouse-airflow-flower
+    restart: unless-stopped
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    env_file: ./airflow/airflow.env
+    command: celery flower
+    ports:
+      - "5555:5555"
+
+volumes:
+  pgdata:
+  clickhouse_data:
+  miniodata:
+  airflow_pgdata:
+  airflow_logs:

@@ -1,0 +1,30 @@
+version: 2
+
+models:
+  - name: revenue_trends
+    description: "Daily revenue with 7-day rolling average and MoM growth"
+    columns:
+      - name: date
+        tests: [unique, not_null]
+      - name: total_revenue
+        tests: [not_null]
+      - name: total_orders
+        tests: [not_null]
+
+  - name: top_products
+    description: "Product performance ranked by revenue per period"
+    columns:
+      - name: product_id
+        tests: [not_null]
+      - name: period
+        tests: [not_null]
+      - name: revenue
+        tests: [not_null]
+
+  - name: customer_ltv
+    description: "Customer LTV with RFM scoring"
+    columns:
+      - name: customer_id
+        tests: [unique, not_null]
+      - name: rfm_score
+        tests: [not_null]
