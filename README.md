@@ -352,4 +352,5 @@ lakehouse/
 │   └── 01_schema.sql
 └── docker-compose.yml            # 32+ containers
 ```
+<img width="946" height="472" alt="image" src="https://github.com/user-attachments/assets/89aca5d2-1a63-49c5-9605-c5ebf2f7a853" />
 
